@@ -1,28 +1,30 @@
 import json
 import os
 import re
-import slack
+import boto3
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 import spacy
-import boto3
+import zipfile
+import sys
 
-# Load Spacy NLP model
-nlp = spacy.load("en_core_web_sm")
+# Initialize a S3 client
+s3_client = boto3.client('s3')
 
 # Initialize a DynamoDB client
 dynamodb = boto3.resource('dynamodb')
-table = dynamodb.Table(os.environ['YOUR_DYNAMODB_TABLE_NAME'])
+table = dynamodb.Table(os.environ['DYNAMODB_TABLE'])
 
 # Initialize a Slack client
 client = WebClient(token=os.environ['SLACK_BOT_TOKEN'])
 
 
-def parse_message(text):
+def parse_message(text, nlp):
     """
     Process the text with Spacy NLP to extract flow, order_id, and error information.
 
     :param text: str
+    :param nlp: Spacy Language model
     :return: tuple
     """
     doc = nlp(text)
@@ -57,35 +59,66 @@ def parse_message(text):
 
 
 def lambda_handler(event, context):
-    """
-    Handle incoming Slack events, validate them, and respond accordingly.
+    # Define S3 bucket and object key
+    bucket_name = os.environ['S3_BUCKET']
+    zip_key = 'dependencies.zip'
 
-    :param event: dict
-    :param context: LambdaContext
-    :return: dict
-    """
-    slack_event = json.loads(event['body'])
+    # Define the download path and extraction directory
+    extract_path = '/tmp/extracted/'
+    if not os.path.exists(extract_path):
+        download_path = '/tmp/dependencies.zip'
 
-    # Slack URL verification handshake
-    if "challenge" in slack_event:
-        return {"statusCode": 200, "body": json.dumps({"challenge": slack_event["challenge"]})}
+        try:
+            # Download the zip file from S3
+            s3_client.download_file(bucket_name, zip_key, download_path)
+        except boto3.exceptions.S3DownloadError as e:
+            log_data = {"error": f"S3 Download Error: {str(e)}"}
+            print(json.dumps(log_data))
+            return {"statusCode": 500, "body": json.dumps(log_data)}
+
+        try:
+            # Extract the zip file
+            with zipfile.ZipFile(download_path, 'r') as zip_ref:
+                zip_ref.extractall(extract_path)
+        except zipfile.BadZipFile as e:
+            log_data = {"error": f"Zip Extraction Error: {str(e)}"}
+            print(json.dumps(log_data))
+            return {"statusCode": 500, "body": json.dumps(log_data)}
+
+    # Add the extracted directory to sys.path
+    sys.path.append(extract_path)
+
+    # Load Spacy NLP model
+    nlp = spacy.load("en_core_web_sm")
 
     try:
-        # Extract message details
+        slack_event = json.loads(event['body'])
+
+        if "challenge" in slack_event:
+            return {"statusCode": 200, "body": json.dumps({"challenge": slack_event["challenge"]})}
+
         text = slack_event['event']['text']
-        flow, order_id, error = parse_message(text)
+        flow, order_id, error = parse_message(text, nlp)
 
         if not (flow and order_id and error):
             raise ValueError("Could not extract all details from the message.")
 
-        # Insert into DynamoDB
-        table.put_item(
-            Item={
-                'order_id': order_id,
-                'flow': flow,
-                'error': error,
+        try:
+            # Prepare the data as a JSON object
+            data = {
+                "Order_id": order_id,
+                "Flow": flow,
+                "Error": error
             }
-        )
+
+            # Insert into DynamoDB
+            table.put_item(Item={'order_id': order_id,
+                           'data': json.dumps(data)})
+        except boto3.exceptions.Boto3Error as e:
+            log_data = {"DynamoDB Error": str(
+                e), "Order_id": order_id, "Flow": flow, "Error": error}
+            print(json.dumps(log_data))
+            return {"statusCode": 500, "body": json.dumps(log_data)}
 
         # Respond to the user in Slack
         channel_id = slack_event['event']['channel']
@@ -96,13 +129,18 @@ def lambda_handler(event, context):
         )
 
     except SlackApiError as e:
-        # Handle Slack API errors here
-        print(f"Slack API Error: {e}")
-        return {"statusCode": 200, "body": json.dumps({"error": str(e)})}
+        log_data = {"Slack API Error": str(e)}
+        print(json.dumps(log_data))
+        return {"statusCode": 200, "body": json.dumps(log_data)}
 
-    except ValueError as e:
-        # Handle extraction errors
-        print(f"Value Error: {e}")
-        return {"statusCode": 200, "body": json.dumps({"error": str(e)})}
+    except json.JSONDecodeError as e:
+        log_data = {"JSON Decode Error": str(e)}
+        print(json.dumps(log_data))
+        return {"statusCode": 400, "body": json.dumps(log_data)}
+
+    except Exception as e:
+        log_data = {"General Error": str(e)}
+        print(json.dumps(log_data))
+        return {"statusCode": 500, "body": json.dumps(log_data)}
 
     return {"statusCode": 200, "body": "Event received"}
