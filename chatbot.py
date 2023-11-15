@@ -2,6 +2,8 @@ import json
 import os
 import re
 import logging
+import hmac
+import hashlib
 import boto3
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
@@ -17,72 +19,89 @@ table = dynamodb.Table(os.environ['DYNAMODB_TABLE'])
 # Initialize a Slack client
 client = WebClient(token=os.environ['SLACK_BOT_TOKEN'])
 
+# Slack signing secret for verification
+slack_signing_secret = os.environ['SLACK_SIGNING_SECRET']
 
-def parse_message(text):
+
+def verify_slack_request(slack_signature, timestamp, body):
     """
-    Process the text to extract flow, order_id, and error information using regular expressions.
-
-    :param text: str
-    :return: tuple
+    Verify the request signature to authenticate Slack requests.
     """
-    flow_match = re.search(r"flow: (\w+)", text)
-    order_id_match = re.search(r"order id: (\d+)", text)
-    error_match = re.search(r"error: (.+)", text)
+    sig_basestring = f"v0:{timestamp}:{body}"
+    my_signature = 'v0=' + hmac.new(
+        bytes(slack_signing_secret, 'utf-8'),
+        bytes(sig_basestring, 'utf-8'),
+        hashlib.sha256
+    ).hexdigest()
+    return hmac.compare_digest(my_signature, slack_signature)
 
-    flow = flow_match.group(1) if flow_match else None
-    order_id = order_id_match.group(1) if order_id_match else None
-    error = error_match.group(1) if error_match else None
 
-    return flow, order_id, error
+def parse_slash_command(text):
+    """
+    Parse the slash command text for error details.
+    """
+    match = re.search(r"flow: (\w+) order id: (\d+) error: (.+)", text)
+    if match:
+        return match.groups()
+    return None, None, None
 
 
 def lambda_handler(event, context):
     try:
-        slack_event = json.loads(event['body'])
+        logging.info("Received event: %s", event)
 
-        # Respond to Slack URL Verification Challenge
+        # Extract necessary details from the event
+        slack_event = json.loads(event['body'])
+        timestamp = event['headers'].get('X-Slack-Request-Timestamp')
+        slack_signature = event['headers'].get('X-Slack-Signature')
+
+        logging.info("Verifying Slack request...")
+        if not verify_slack_request(slack_signature, timestamp, event['body']):
+            logging.warning("Verification failed")
+            return {"statusCode": 403, "body": "Verification failed"}
+
         if "challenge" in slack_event:
+            logging.info("Responding to Slack URL Verification Challenge")
             return {
                 "statusCode": 200,
                 "headers": {"Content-Type": "application/json"},
                 "body": json.dumps({"challenge": slack_event["challenge"]})
             }
 
-        text = slack_event['event']['text']
-        flow, order_id, error = parse_message(text)
+        if 'command' in slack_event['command'] == '/logerror':
+            logging.info("Processing /logerror command")
+            flow, order_id, error = parse_slash_command(slack_event['text'])
 
-        if not (flow and order_id and error):
-            raise ValueError("Could not extract all details from the message.")
+            if not (order_id and flow and error):
+                logging.warning("Invalid format for /logerror command")
+                raise ValueError(
+                    "Invalid format. Please use 'flow: [flow] order id: [order_id] error: [error]'.")
 
-        # Prepare the data as a JSON object
-        data = {
-            "Order_id": order_id,
-            "Flow": flow,
-            "Error": error,
-            "Timestamp": datetime.now().isoformat()
-        }
+            logging.info("Preparing data for DynamoDB")
+            data = {
+                "Order_id": order_id,
+                "Flow": flow,
+                "Error": error,
+                "Timestamp": datetime.now().isoformat()
+            }
 
-        # Insert into DynamoDB
-        table.put_item(Item=data)
+            logging.info("Inserting data into DynamoDB")
+            table.put_item(Item=data)
 
-        # Respond to the user in Slack
-        channel_id = slack_event['event']['channel']
-        user = slack_event['event']['user']
-        client.chat_postMessage(
-            channel='channel',
-            text=f"Hello <@{user}>, your issue with Order ID {order_id} has been logged."
-        )
+            logging.info("Sending confirmation message to Slack")
+            response_message = f"Your issue with Order ID {order_id} has been logged."
+            client.chat_postMessage(
+                channel=slack_event['channel_id'], text=response_message)
+
+            return {"statusCode": 200, "body": "Command processed"}
+
+        logging.info("No action taken for the received event")
+        return {"statusCode": 200, "body": "No action taken"}
 
     except SlackApiError as e:
         logging.error(f"Slack API Error: {e}")
         return {"statusCode": 200, "body": json.dumps({"Slack API Error": str(e)})}
 
-    except json.JSONDecodeError as e:
-        logging.error(f"JSON Decode Error: {e}")
-        return {"statusCode": 400, "body": json.dumps({"JSON Decode Error": str(e)})}
-
     except Exception as e:
         logging.error(f"General Error: {e}")
-        return {"statusCode": 500, "body": json.dumps({"General Error": str(e)})}
-
-    return {"statusCode": 200, "body": "Event received"}
+        return {"statusCode": 500, "body": json.dumps({"Error": str(e)})}
