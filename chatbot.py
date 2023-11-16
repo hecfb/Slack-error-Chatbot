@@ -43,16 +43,18 @@ def parse_slash_command(text):
     """
     Parse the slash command text to extract order_id, flow, and error.
     """
-    # Regular expressions to match different input formats
     order_id_match = re.search(
-        r"order[_\s]*id[=:]\s*(\d+)", text, re.IGNORECASE)
-    flow_match = re.search(r"flow[=:]\s*{([^}]*)}", text, re.IGNORECASE)
-    error_match = re.search(r"error[=:]\s*([^\n]+)", text, re.IGNORECASE)
+        r"order[_\s]*id[=:\s]+\s*(\d+)", text, re.IGNORECASE)
+    flow_match = re.search(
+        r"flow[=:\s]+\s*{?\s*([^}]*)\s*}?", text, re.IGNORECASE)
+    error_match = re.search(
+        r"error[=:\s]+\s*([^\n,]+)", text, re.IGNORECASE)
 
     if order_id_match and flow_match and error_match:
+        flow_list = [event.strip() for event in flow_match.group(1).split(',')]
         return {
             "order_id": int(order_id_match.group(1)),
-            "flow": flow_match.group(1).split(','),
+            "flow": flow_list,
             "error": error_match.group(1).strip(),
             "original_input": text
         }
